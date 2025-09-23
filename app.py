@@ -4,7 +4,6 @@ import cv2
 from ultralytics import YOLO
 from camera import VideoCamera
 import pymcprotocol
-import struct
 
 # === PLC Configuration ===
 PLC_IP = "192.168.1.12"
@@ -32,14 +31,12 @@ try:
 except Exception as e:
     print(f"⚠️ PLC Connection Failed: {e}")
     print("🧪 Running in TEST MODE without PLC")
-    print("📋 Detection will run automatically for testing")
     mc = None
 
-# === PLC Bit Functions ===
+# === PLC Functions ===
 def read_trigger():
     if not plc_connected or mc is None:
-        # For testing without PLC - auto trigger every few seconds
-        return True
+        return True  # Auto-trigger in test mode
     
     try:
         data = mc.batchread_bitunits(headdevice=TRIGGER_COIL, readsize=1)
@@ -58,15 +55,17 @@ def reset_trigger():
     except Exception as e:
         print(f"❌ Trigger reset failed: {e}")
 
-def write_result(val_d11, val_d21):
+def write_result(result_value):
+    """Write OK/NG result to PLC"""
     if not plc_connected or mc is None:
-        print(f"🧪 TEST MODE - Would send to PLC → D11: {val_d11}, D21: {val_d21}")
+        result_text = "OK" if result_value == 1 else "NG"
+        print(f"🧪 TEST MODE - Would send to PLC → D11: {result_value} ({result_text})")
         return
         
     try:
-        mc.batchwrite_wordunits(headdevice="D11", values=[val_d11])
-        mc.batchwrite_wordunits(headdevice="D21", values=[val_d21])
-        print(f"📤 Sent Results → D11: {val_d11}, D21: {val_d21}")
+        mc.batchwrite_wordunits(headdevice="D11", values=[result_value])
+        result_text = "OK" if result_value == 1 else "NG"
+        print(f"📤 Sent Result → D11: {result_value} ({result_text})")
     except Exception as e:
         print(f"❌ PLC write error: {e}")
 
@@ -79,48 +78,81 @@ def detect_once():
 
     # Run YOLO detection
     results = model(frame, imgsz=640)[0]
-    missing_d11 = 0  # For caps 1,3,5 → D11
-    missing_d21 = 0  # For caps 2,4,6 → D21
-    missing_caps = set()
+    
+    # Initialize result as OK (1)
+    detection_result = 1  # 1 = OK, 0 = NG
+    detected_objects = []
 
     # Process detections
-    for box in results.boxes.data:
-        cls = int(box[-1])
-        cap = cls + 1
-        missing_caps.add(cap)
+    if results.boxes is not None and len(results.boxes.data) > 0:
+        for box in results.boxes.data:
+            cls = int(box[-1])
+            class_name = model.names[cls]
+            confidence = float(box[4])
+            
+            detected_objects.append(class_name)
+            
+            # Draw bounding box
+            xyxy = box[:4].cpu().numpy().astype(int)
+            
+            # Set color based on class
+            if class_name.lower() == 'ok':
+                color = (0, 255, 0)  # Green for OK
+                detection_result = 1  # OK
+            else:  # NG or any other class
+                color = (0, 0, 255)  # Red for NG
+                detection_result = 0  # NG
+            
+            cv2.rectangle(frame, (xyxy[0], xyxy[1]), (xyxy[2], xyxy[3]), color, 2)
+            cv2.putText(frame, f"{class_name} ({confidence:.2f})", 
+                       (xyxy[0], xyxy[1] - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+    else:
+        # No detections found
+        detection_result = 0  # NG (no object detected)
+        detected_objects = ["No objects detected"]
 
-        # Draw bounding box
-        xyxy = box[:4].cpu().numpy().astype(int)
-        label = model.names[cls]
-        cv2.rectangle(frame, (xyxy[0], xyxy[1]), (xyxy[2], xyxy[3]), (0, 255, 0), 2)
-        cv2.putText(frame, label, (xyxy[0], xyxy[1] - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    # Determine final result
+    if detected_objects:
+        # Check if any NG detected
+        ng_detected = any('ng' in obj.lower() for obj in detected_objects)
+        ok_detected = any('ok' in obj.lower() for obj in detected_objects)
+        
+        if ng_detected:
+            detection_result = 0  # NG
+        elif ok_detected:
+            detection_result = 1  # OK
+        else:
+            detection_result = 0  # NG (unknown objects)
+    
+    result_text = "✅ OK" if detection_result == 1 else "❌ NG"
+    print(f"🧠 Detection Result: {result_text}")
+    print(f"📋 Detected: {detected_objects}")
+    
+    # Send result to PLC
+    write_result(detection_result)
 
-        # Encode missing caps to PLC values
-        if cap in [1, 3, 5]:
-            bit = [1, 3, 5].index(cap)  # bit 0,1,2
-            missing_d11 |= (1 << bit)
-        elif cap in [2, 4, 6]:
-            bit = [2, 4, 6].index(cap)  # bit 0,1,2
-            missing_d21 |= (1 << bit)
-
-    print(f"🧠 Missing caps: {sorted(missing_caps)} → D11: {missing_d11}, D21: {missing_d21}")
-    write_result(missing_d11, missing_d21)
-
-    # Show frame for testing (remove in production)
+    # Show frame for testing
     if not plc_connected:
-        cv2.imshow('YOLO Detection - Test Mode', frame)
+        # Add result text on frame
+        result_display = "OK" if detection_result == 1 else "NG"
+        result_color = (0, 255, 0) if detection_result == 1 else (0, 0, 255)
+        cv2.putText(frame, f"RESULT: {result_display}", (50, 50),
+                   cv2.FONT_HERSHEY_SIMPLEX, 1.5, result_color, 3)
+        
+        cv2.imshow('OK/NG Detection System', frame)
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             return "quit"
-        elif key == ord(' '):  # Spacebar to manually trigger
+        elif key == ord(' '):  # Spacebar for manual trigger
             return "manual_trigger"
     
     return "success"
 
 # === Main Loop ===
-print("🚀 Starting cap detection system...")
+print("🚀 Starting OK/NG Detection System...")
 print(f"📁 Using model: {model_path}")
+print("🎯 Classes: OK (1) / NG (0)")
 
 if plc_connected:
     print("🔗 PLC Mode: Waiting for trigger signal...")
@@ -129,6 +161,8 @@ else:
 
 try:
     detection_count = 0
+    ok_count = 0
+    ng_count = 0
     
     while True:
         trigger_detected = False
@@ -139,9 +173,9 @@ try:
                 trigger_detected = True
                 print(f"🟢 PLC Trigger Received #{detection_count + 1}")
         else:
-            # Test mode - auto trigger every 3 seconds or manual trigger
+            # Test mode - auto trigger every 3 seconds
             trigger_detected = True
-            print(f"🧪 Auto Detection #{detection_count + 1} (Press SPACE for manual)")
+            print(f"🧪 Auto Detection #{detection_count + 1}")
         
         if trigger_detected:
             result = detect_once()
@@ -158,9 +192,9 @@ try:
                 reset_trigger()
             else:
                 # In test mode, limit to prevent spam
-                if detection_count >= 10:
-                    print("🧪 Test completed after 10 detections")
-                    print("📋 To run with PLC, fix connection to 192.168.1.12:5007")
+                if detection_count >= 20:
+                    print(f"🧪 Test completed after {detection_count} detections")
+                    print(f"📊 Summary - OK: {ok_count}, NG: {ng_count}")
                     break
         
         # Sleep timing
@@ -169,6 +203,7 @@ try:
 
 except KeyboardInterrupt:
     print("\n⏹️ Stopped by user (Ctrl+C)")
+    print(f"📊 Final Summary - Total: {detection_count}, OK: {ok_count}, NG: {ng_count}")
 except Exception as e:
     print(f"❌ Unexpected error: {e}")
 finally:
