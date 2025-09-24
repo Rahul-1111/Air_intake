@@ -6,7 +6,7 @@ from camera import VideoCamera
 import pymcprotocol
 
 # === PLC Configuration ===
-PLC_IP = "192.168.1.12"
+PLC_IP = "192.168.3.45"
 TRIGGER_COIL = "M10"   # Bit coil
 RESULT_ADDR = 11       # D11
 
@@ -101,7 +101,7 @@ def detect_once():
                 detection_result = 1  # OK
             else:  # NG or any other class
                 color = (0, 0, 255)  # Red for NG
-                detection_result = 0  # NG
+                detection_result = 2  # NG
             
             cv2.rectangle(frame, (xyxy[0], xyxy[1]), (xyxy[2], xyxy[3]), color, 2)
             cv2.putText(frame, f"{class_name} ({confidence:.2f})", 
@@ -119,7 +119,7 @@ def detect_once():
         ok_detected = any('ok' in obj.lower() for obj in detected_objects)
         
         if ng_detected:
-            detection_result = 0  # NG
+            detection_result = 2  # NG
         elif ok_detected:
             detection_result = 1  # OK
         else:
